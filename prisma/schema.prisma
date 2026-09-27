@@ -1,0 +1,272 @@
+// AIVLS — Automated Invigilator Allocation & Venue Locator System
+// Prisma schema (PostgreSQL)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  EXAM_OFFICER
+  INVIGILATOR
+  STUDENT
+}
+
+enum AllocationStatus {
+  ASSIGNED
+  CONFIRMED
+  CHECKED_IN
+  COMPLETED
+  NO_SHOW
+  CANCELLED
+}
+
+enum AttendanceMethod {
+  AUTO_GEOFENCE
+  MANUAL
+}
+
+enum ExamStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum IncidentType {
+  CHEATING
+  MEDICAL
+  TECHNICAL
+  OTHER
+}
+
+enum SubmissionStatus {
+  SUBMITTED
+  REVIEWED
+  ARCHIVED
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  fullName     String
+  role         Role     @default(INVIGILATOR)
+  department   String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  invigilatorProfile InvigilatorProfile?
+  studentProfile     StudentProfile?
+
+  @@index([role])
+}
+
+// Extra fields specific to invigilators, kept separate from User
+// so admins/exam officers don't carry unused workload/availability data.
+model InvigilatorProfile {
+  id         String   @id @default(uuid())
+  userId     String   @unique
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  maxPerWeek Int      @default(5)
+  isAvailable Boolean @default(true)
+
+  allocations     Allocation[]
+  availabilities  Availability[]
+  locationPings   LocationPing[]
+  conflicts       InvigilatorConflict[]
+  incidentsReported Incident[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Declared time-off / unavailability windows, checked by the allocation engine.
+model Availability {
+  id             String   @id @default(uuid())
+  invigilatorId  String
+  invigilator    InvigilatorProfile @relation(fields: [invigilatorId], references: [id], onDelete: Cascade)
+  startTime      DateTime
+  endTime        DateTime
+  reason         String?
+  createdAt      DateTime @default(now())
+
+  @@index([invigilatorId, startTime, endTime])
+}
+
+// Conflict-of-interest declarations (e.g. can't invigilate own department/course)
+// so the "unbiased" allocator can hard-exclude these candidates.
+model InvigilatorConflict {
+  id             String   @id @default(uuid())
+  invigilatorId  String
+  invigilator    InvigilatorProfile @relation(fields: [invigilatorId], references: [id], onDelete: Cascade)
+  courseCode     String?
+  department     String?
+  reason         String?
+  createdAt      DateTime @default(now())
+
+  @@index([invigilatorId])
+}
+
+// Extra fields specific to students. A student's "papers today" and venue
+// info is derived by matching their enrolled course codes against Exam
+// records — no direct link to specific Exam rows is needed, so adding a
+// new course automatically surfaces any exam scheduled for it.
+model StudentProfile {
+  id            String   @id @default(uuid())
+  userId        String   @unique
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  matricNumber  String?  @unique
+  level         String?
+
+  enrollments Enrollment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// A student's registration for a course. Exams are matched to students by
+// courseCode, so a student sees an exam's paper/venue as soon as both the
+// enrollment and the exam exist — in either order.
+model Enrollment {
+  id          String   @id @default(uuid())
+  studentId   String
+  student     StudentProfile @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  courseCode  String
+  courseTitle String?
+  createdAt   DateTime @default(now())
+
+  @@unique([studentId, courseCode])
+  @@index([courseCode])
+}
+
+model Venue {
+  id             String   @id @default(uuid())
+  name           String
+  building       String
+  block          String?
+  room           String?
+  capacity       Int
+  latitude       Float
+  longitude      Float
+  geofenceRadius Int      @default(75) // metres — tune per venue (bigger for open fields/halls)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  exams Exam[]
+
+  @@index([latitude, longitude])
+}
+
+model Exam {
+  id                   String     @id @default(uuid())
+  courseCode           String
+  courseTitle          String
+  department           String?
+  date                 DateTime   // exam date
+  startTime            DateTime   // full timestamp, start
+  endTime              DateTime   // full timestamp, end
+  venueId              String
+  venue                Venue      @relation(fields: [venueId], references: [id])
+  requiredInvigilators Int        @default(1)
+  status               ExamStatus @default(SCHEDULED)
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+
+  allocations Allocation[]
+  incidents   Incident[]
+
+  @@index([venueId, startTime, endTime])
+  @@index([date])
+}
+
+// The join between an exam and an invigilator, produced by the allocation engine.
+model Allocation {
+  id             String            @id @default(uuid())
+  examId         String
+  exam           Exam              @relation(fields: [examId], references: [id], onDelete: Cascade)
+  invigilatorId  String
+  invigilator    InvigilatorProfile @relation(fields: [invigilatorId], references: [id])
+  status         AllocationStatus  @default(ASSIGNED)
+  assignedAt     DateTime          @default(now())
+  // Fairness bookkeeping: snapshot of the invigilator's running allocation
+  // count at the moment they were picked, useful for auditing the algorithm.
+  loadAtAssignment Int
+  // Set once an admin/exam officer has reviewed the auto-generated roster
+  // and approved it — this is the moment the invigilator is considered
+  // "notified" of their final assignment.
+  notifiedAt     DateTime?
+
+  attendance Attendance?
+  submission ExamSubmission?
+
+  @@unique([examId, invigilatorId])
+  @@index([invigilatorId])
+}
+
+// One attendance record per allocation — either auto-marked by the geofence
+// check or manually confirmed as a fallback.
+model Attendance {
+  id            String            @id @default(uuid())
+  allocationId  String            @unique
+  allocation    Allocation        @relation(fields: [allocationId], references: [id], onDelete: Cascade)
+  checkInTime   DateTime?
+  checkInLat    Float?
+  checkInLng    Float?
+  distanceMeters Float?
+  method        AttendanceMethod?
+  createdAt     DateTime          @default(now())
+}
+
+// Raw GPS pings from the invigilator's device while an exam window is active.
+// Kept as a rolling log for audit/dispute resolution; the geofence service
+// evaluates the latest ping(s) against the assigned venue.
+model LocationPing {
+  id            String   @id @default(uuid())
+  invigilatorId String
+  invigilator   InvigilatorProfile @relation(fields: [invigilatorId], references: [id], onDelete: Cascade)
+  latitude      Float
+  longitude     Float
+  accuracy      Float?
+  recordedAt    DateTime @default(now())
+
+  @@index([invigilatorId, recordedAt])
+}
+
+// An incident an invigilator logs during the exam — cheating, a medical
+// issue, or a technical glitch — visible to admins in real time.
+model Incident {
+  id           String       @id @default(uuid())
+  examId       String
+  exam         Exam         @relation(fields: [examId], references: [id], onDelete: Cascade)
+  reportedById String
+  reportedBy   InvigilatorProfile @relation(fields: [reportedById], references: [id])
+  type         IncidentType
+  description  String
+  createdAt    DateTime     @default(now())
+
+  @@index([examId])
+}
+
+// The invigilator's end-of-exam report: papers collected, attendance
+// counts, and any closing notes. One per allocation (each invigilator
+// files their own). Admin reviews and archives these afterward.
+model ExamSubmission {
+  id              String           @id @default(uuid())
+  allocationId    String           @unique
+  allocation      Allocation       @relation(fields: [allocationId], references: [id], onDelete: Cascade)
+  papersCollected Int
+  studentsPresent Int
+  studentsAbsent  Int
+  notes           String?
+  status          SubmissionStatus @default(SUBMITTED)
+  submittedAt     DateTime         @default(now())
+  reviewedAt      DateTime?
+  reviewedById    String?
+}
